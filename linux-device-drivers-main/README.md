@@ -1,278 +1,191 @@
-# Linux Device Drivers
+# Linux Device Driver Lab
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Language: C](https://img.shields.io/badge/language-C-00599C.svg?logo=c&logoColor=white)](.)
-[![Platform: Linux Kernel Module](https://img.shields.io/badge/platform-Linux%20Kernel%20Module-FCC624.svg?logo=linux&logoColor=black)](.)
-[![Dev env: Docker](https://img.shields.io/badge/dev%20env-Docker-2496ED.svg?logo=docker&logoColor=white)](.)
-[![Tested under: QEMU](https://img.shields.io/badge/tested%20under-QEMU-FF6600.svg?logo=qemu&logoColor=white)](.)
+[![Language](https://img.shields.io/badge/language-C-00599C?logo=c&logoColor=white)](.)
+[![Platform](https://img.shields.io/badge/platform-Linux%20Kernel-FCC624?logo=linux&logoColor=black)](.)
+[![Containers](https://img.shields.io/badge/environment-Docker-2496ED?logo=docker&logoColor=white)](.)
+[![Virtualization](https://img.shields.io/badge/testing-QEMU-FF6600?logo=qemu&logoColor=white)](.)
 
-Four Linux kernel modules, each targeting a different driver subsystem and the
-contract it imposes between kernel and user space, hardware, or the networking
-stack. None require physical hardware: every driver builds and runs end-to-end
-in Docker + QEMU against a real kernel, on Linux, macOS, or Windows.
+A hands-on collection of Linux kernel modules for exploring four important driver areas: character devices, block devices, network interfaces, and PCIe devices. The projects are designed to demonstrate how kernel components communicate with user space and interact with the Linux device, storage, and networking subsystems.
 
-| Driver | Subsystem | Core mechanisms |
+The test workflows use Docker and QEMU so the drivers can be built and exercised in a virtual environment without requiring dedicated physical hardware. Check each module's own documentation for its exact prerequisites and test procedure.
+
+## Driver Overview
+
+| Project | Subsystem | Main concepts |
 |---|---|---|
-| [`linux-character-device-driver`](linux-character-device-driver/) | Character device | `file_operations`, mutex, wait queues, blocking I/O, `ioctl` |
-| [`linux-block-device-driver`](linux-block-device-driver/) | Block I/O (`gendisk`/blk-mq) | `bio`/`request` segment iteration, spinlock-protected memcpy, page cache vs. `O_DIRECT` |
-| [`linux-network-device-driver`](linux-network-device-driver/) | Networking (`net_device`) | `sk_buff`, descriptor rings, NAPI, TX queue backpressure |
+| [`linux-character-device-driver`](linux-character-device-driver/) | Character devices | `file_operations`, mutexes, wait queues, blocking reads and writes, `ioctl` |
+| [`linux-block-device-driver`](linux-block-device-driver/) | Block I/O | `gendisk`, blk-mq, bio/request processing, spinlocks, page cache and `O_DIRECT` |
+| [`linux-network-device-driver`](linux-network-device-driver/) | Networking | `net_device`, `sk_buff`, descriptor rings, NAPI, transmit-queue backpressure |
 | [`linux-pcie-device-driver`](linux-pcie-device-driver/) | PCI / PCIe | BAR-mapped MMIO, MSI interrupts, DMA buffer management |
 
----
+## Projects at a Glance
 
-## Overview
+### 1. Character Device — `circbuf`
 
-Each project targets a different kernel subsystem on purpose, so that together
-they cover most of the contracts a driver author has to get right.
+This module exposes a circular buffer through `/dev/circbuf`. Writers add bytes to a fixed-capacity buffer and readers consume them in FIFO order. When the buffer is full, writers can wait for space; when it is empty, readers can wait for data. Synchronization primitives coordinate access by multiple processes.
 
-### [`circbuf`](linux-character-device-driver/) — Virtual Character Device
+Concepts covered include:
 
-A kernel module that registers `/dev/circbuf` as a bounded circular-buffer
-device. Writers produce bytes into a fixed-size buffer; readers consume them in
-FIFO order. When the buffer is full, writers block; when it is empty, readers
-block. Multiple processes can open the device concurrently and are safely
-arbitrated through kernel synchronization primitives.
+- Registering device operations through `struct file_operations`.
+- Transferring data safely between kernel space and user space with `copy_to_user` and `copy_from_user`.
+- Choosing between mutexes and spinlocks according to the execution context.
+- Using `wait_queue_head_t` to support blocking I/O.
+- Defining `ioctl` commands for device-specific operations.
 
-**What it covers:** `file_operations` vtable (C-level polymorphism between VFS
-and the driver); `copy_to_user`/`copy_from_user` for crossing the kernel/user
-boundary safely; `mutex` for sleeping critical sections vs. `spinlock` for
-atomic ones; `wait_queue_head_t` for blocking I/O; and `ioctl` design for
-out-of-band device control. Because there is no hardware dependency, the focus
-stays entirely on getting these contracts right.
+**Core interface:** `struct file_operations`, which connects operations such as `open`, `read`, `write`, `ioctl`, and `release` to the driver.
 
-**Key object:** `struct file_operations` — a vtable of function pointers the
-kernel calls when user space invokes `open`, `read`, `write`, `ioctl`, or
-`release` on the device file.
+### 2. Block Device — `vblk`
 
----
+The `vblk` module presents a RAM-backed block device at `/dev/vblk0`. Its storage is held in kernel memory, while its interfaces allow user-space tools to treat it like a disk. Operations such as `dd`, `mkfs`, `mount`, `pread`, and `pwrite` can be used to exercise the block layer.
 
-### [`vblk`](linux-block-device-driver/) — Virtual RAM-backed Block Device
+Concepts covered include:
 
-A kernel module that registers `/dev/vblk0` backed by a `vmalloc`'d region
-of kernel memory. It behaves like a real disk: `dd`, `mkfs`, `mount`, and
-arbitrary `pread`/`pwrite` all work against it because it implements the same
-`gendisk` / `block_device_operations` / `blk_mq_ops` contract every real block
-driver implements. Only the "hardware" — a contiguous kernel buffer instead of
-a physical device — differs.
+- Registering a disk and its request queue with `gendisk` and blk-mq.
+- Handling I/O through `bio` and request segments.
+- Protecting shared data in driver execution paths.
+- Understanding how buffered I/O uses the page cache and how `O_DIRECT` changes that path.
+- Exercising a filesystem workflow, including formatting, mounting, file operations, and unmounting.
 
-**What it covers:** `gendisk` + blk-mq registration (`blk_mq_alloc_disk`,
-`add_disk`); `bio`/`request` segment iteration inside `queue_rq`; why a
-`spinlock` is the right primitive once `copy_to/from_user` is off the table;
-and the page-cache vs. `O_DIRECT` distinction that governs whether I/O ever
-reaches the driver at all. The test suite validates all three paths: buffered
-I/O through the page cache, `O_DIRECT` bypassing it, and a full
-`mke2fs` + `mount` + file I/O + `umount` round trip through ext2.
+**Core interfaces:** `struct gendisk` and `struct blk_mq_tag_set`.
 
-**Key object:** `struct gendisk` paired with a `struct blk_mq_tag_set` — the
-block-layer analogue of `file_operations`.
+### 3. Network Device — `netdrv`
 
----
+This module creates a software Ethernet pair named `vnet0` and `vnet1`. Traffic sent through one interface can be received by the other, providing a way to explore networking-driver mechanics without a physical network card.
 
-### [`netdrv`](linux-network-device-driver/) — Virtual Ethernet Driver Pair with NAPI
+Concepts covered include:
 
-A kernel module that creates a software point-to-point Ethernet pair (`vnet0`
-↔ `vnet1`) built around the same structures a real NIC driver uses: TX/RX
-descriptor rings, NAPI interrupt-mitigated packet reception, and
-`netif_stop_queue`/`netif_wake_queue` TX backpressure. A packet transmitted
-on one interface appears as received on the other; the "wire" is software,
-but the driver-side mechanics follow the real networking stack contracts.
+- Registering a network interface through `struct net_device` and `struct net_device_ops`.
+- Managing packets with `struct sk_buff`.
+- Using transmit and receive descriptor rings.
+- Processing received packets with NAPI polling.
+- Applying transmit-queue backpressure with `netif_stop_queue` and `netif_wake_queue`.
+- Testing interfaces in isolated network namespaces.
 
-**What it covers:** `net_device` registration and `net_device_ops`; `sk_buff`
-lifecycle (allocation, headroom, push/pull); NAPI (why per-packet interrupts
-would saturate the CPU and how poll-based batching avoids it); TX queue
-backpressure under load; and network namespace isolation for testing. The
-project includes a real end-to-end `ping` test that caught an actual bug during
-development — `IFF_NOARP` made ring counters look healthy while `ping` silently
-failed 100% of the time.
+The included end-to-end workflow can use `ping` to verify connectivity between the virtual interfaces.
 
-**Key object:** `struct net_device` — the networking stack's equivalent of
-`gendisk`, paired with a `struct napi_struct` per interface.
+**Core interfaces:** `struct net_device` and `struct napi_struct`.
 
----
+### 4. PCIe Device — `pcie-edu-driver`
 
-### [`pcie-edu-driver`](linux-pcie-device-driver/) — PCIe Driver for QEMU's `edu` Device
+This module targets QEMU's educational PCI device named `edu`. The emulated device is enumerated on the PCI bus and provides memory-mapped registers, interrupt support, and a DMA engine. This creates a virtual environment for exploring the lifecycle of a PCI driver.
 
-A kernel module that drives QEMU's built-in `edu` educational PCI device
-(vendor `0x1234`, device `0x11e8`). Unlike the virtual drivers above, this
-targets a device that is enumerated over the PCIe bus, has BAR-mapped memory
-registers, raises hardware interrupts, and exposes a DMA engine — it just
-happens to be emulated by QEMU rather than soldered to a board. The driver
-code, and everything it has to get right, is identical to what a real NIC,
-storage controller, or accelerator driver requires.
+Concepts covered include:
 
-**What it covers:** the full PCI driver lifecycle (`pci_enable_device`,
-`pci_iomap` for BAR0 MMIO, `pci_alloc_irq_vectors` for MSI,
-`dma_alloc_coherent` for DMA buffers, `pci_unregister_driver` cleanup);
-`ioread32`/`iowrite32` for MMIO register access; an MSI interrupt handler that
-wakes a wait queue to unblock a user-space `ioctl`; and a DMA round-trip test
-(host → device → host). The driver also exposes a `misc` character device at
-`/dev/pcie_edu` so user space can trigger factorial computations and DMA
-transfers via `ioctl`.
+- Enabling and registering a PCI device.
+- Mapping a device's BAR region for memory-mapped I/O.
+- Reading and writing registers with `ioread32` and `iowrite32`.
+- Registering MSI interrupt vectors.
+- Allocating coherent DMA buffers and testing data transfers.
+- Cleaning up resources when the device is removed or the module is unloaded.
+- Exposing user-facing operations through `/dev/pcie_edu` and `ioctl` commands.
 
-**Key object:** `struct pci_dev` — the bus-enumerated device handle, paired
-with BAR-mapped MMIO, an MSI interrupt vector, and a `dma_alloc_coherent`
-buffer.
+**Core interface:** `struct pci_dev`, together with mapped registers, an interrupt vector, and DMA buffers.
 
----
+## How the Projects Fit Together
 
-### How the Four Projects Relate
+The character-device example introduces the kernel/user-space boundary and synchronization. The block-device example applies related ideas to queued storage requests and disk semantics. The network driver explores packet handling and NAPI, while the PCIe example adds bus enumeration, memory-mapped registers, interrupts, and DMA.
 
-The character device establishes the kernel/user-space boundary and
-synchronization primitives. The block device moves that same contract into the
-block layer's request/bio model, and introduces the page-cache visibility
-problem. The networking and PCIe drivers build further on that foundation while
-introducing their own subsystem-specific object models (`net_device`/`sk_buff`
-vs. `pci_dev`/MMIO/MSI) and execution-context rules (softirq NAPI polling vs.
-hardirq MSI handling).
-
----
+Together, the modules provide practical examples of how different Linux subsystems define their own interfaces, execution contexts, and resource-management requirements.
 
 ## Repository Layout
 
 ```text
-.
-├── linux-character-device-driver/   # circbuf — virtual character device
-├── linux-block-device-driver/       # vblk    — virtual RAM-backed block device
-├── linux-network-device-driver/     # netdrv  — virtual Ethernet driver pair
-├── linux-pcie-device-driver/        # pcie-edu-driver — QEMU "edu" PCIe driver
-└── LICENSE                          # MIT
+linux-device-drivers-main/
+├── linux-character-device-driver/   # Circular-buffer character device
+├── linux-block-device-driver/       # RAM-backed block device
+├── linux-network-device-driver/     # Virtual Ethernet pair
+└── linux-pcie-device-driver/        # QEMU educational PCIe device
 ```
 
-Each subdirectory is self-contained, with its own `Makefile`, `docker/`
-test harness, and `README.md` covering architecture, key concepts,
-build/test instructions, design tradeoffs, and verified test results.
+Each driver directory contains its own implementation and build/test files. Refer to its local README for subsystem-specific details and any driver-specific requirements.
 
----
-
-## Building and Testing
+## Getting Started
 
 ### Prerequisites
 
-| Tool | Minimum version | Notes |
+| Tool | Requirement | Purpose |
 |---|---|---|
-| Docker | 20.10+ | Required for the recommended Docker + QEMU path |
-| QEMU | 6.0+ | Embedded inside the Docker image; no host install needed |
-| make / gcc | any recent | Only needed for native (non-Docker) builds |
-| Linux host with matching kernel headers | — | Alternative to Docker; see each project's README |
+| Docker | Version 20.10 or later is recommended | Builds and runs the test environment in a container |
+| QEMU | Used by the Docker-based test setup | Boots a virtual machine for end-to-end tests |
+| `make` and GCC | Recent versions for native builds | Builds kernel modules outside the container workflow |
+| Linux kernel headers | Must match the running kernel for native builds | Provides the kernel interfaces needed for compilation |
 
-No physical hardware, no Linux host, and no QEMU pre-install are required for
-the default Docker path. Docker pulls the matching kernel headers and QEMU
-image automatically.
+The container-based route is intended to reduce host setup. Review the driver-specific documentation before running a workflow, especially if your environment uses a different architecture or kernel version.
 
-### Quick start
-
-Every driver follows the same pattern: build against real kernel headers inside
-Docker, boot a stock kernel under QEMU, then load and exercise the module
-end-to-end — not a build-only check.
+### Clone the Repository
 
 ```bash
-# circbuf, vblk, pcie-edu-driver
-cd <project-directory>
+git clone https://github.com/Pragati4566/KernelEdge.git
+cd KernelEdge/linux-device-drivers-main
+```
+
+### Run the Docker-Based Tests
+
+For the character, block, and PCIe drivers, the general command pattern is:
+
+```bash
+cd <driver-directory>
 ./docker/run.sh test
 ```
 
+For the network driver, use its Dockerfile:
+
 ```bash
-# netdrv (self-contained Docker image)
 cd linux-network-device-driver
-docker build -f docker/Dockerfile -t netdrv-e2e . && docker run --rm netdrv-e2e
+docker build -f docker/Dockerfile -t netdrv-e2e .
+docker run --rm netdrv-e2e
 ```
 
-### What the harness does
+Run these commands from the appropriate driver directory. Exact scripts and available options may differ between modules.
 
-`docker/run.sh test` (and the equivalent `netdrv` command):
+### What the Test Harness Does
 
-1. Builds the `.ko` against real kernel headers inside a Docker container.
-2. Boots a stock `6.8.0-124-generic` kernel under QEMU with a minimal busybox
-   initramfs.
-3. `insmod`s the module, runs the test suite (basic I/O, stress, filesystem
-   mount where applicable, ioctl round-trips), and `rmmod`s the module.
-4. Checks `dmesg` for panics, lockups, or unexpected warnings.
-5. Exits non-zero on any failure.
+Where implemented by the individual driver, the container-based harness can:
 
-### Native (non-Docker) builds
+1. Build the kernel module against the configured kernel headers.
+2. Start a Linux kernel in QEMU with a minimal userspace environment.
+3. Load the module, execute driver tests, and unload it.
+4. Exercise relevant paths such as device I/O, stress scenarios, filesystem operations, or `ioctl` calls.
+5. Check kernel logs for serious errors and return a failure status when a test fails.
 
-Each project's README documents a native build path for environments where
-Docker is unavailable. The general pattern:
+Consult the relevant driver's README and scripts to confirm which of these checks are available for that module.
+
+### Native Build Workflow
+
+For a native Linux environment with matching kernel headers, the workflow generally looks like this:
 
 ```bash
-make                  # build the .ko against the running kernel's headers
-sudo insmod <mod>.ko
-dmesg | tail -20      # confirm probe / registration
-sudo ./<test_binary>
-sudo rmmod <mod>
+make                         # Build the module
+sudo insmod <module-name>.ko # Load the module
+dmesg | tail -20             # Inspect recent kernel messages
+sudo ./<test-binary>          # Run the module's test program
+sudo rmmod <module-name>     # Unload the module
 ```
 
-This requires a Linux host (or VM) with matching kernel headers and — for the
-PCIe driver — a QEMU session started with `-device edu`.
+Replace the placeholder names with those used by the selected driver. The PCIe example also requires an appropriately configured QEMU session with the educational `edu` device enabled.
 
----
+## Test Coverage
 
-## Verified Test Results
+The project includes driver-specific checks for loading and unloading modules, basic device operations, and selected edge cases. Depending on the module, tests may cover concurrent circular-buffer access, direct and buffered block I/O, filesystem operations, virtual-network connectivity, interrupt handling, or DMA transfers.
 
-All four drivers pass their full test suites against kernel
-`6.8.0-124-generic` (Ubuntu 24.04, aarch64 / QEMU `virt` or `q35`).
+Use the test scripts and latest run output in your checkout as the source of truth for test status. Do not treat a successful build alone as proof that a driver works correctly, and rerun the relevant tests after making changes.
 
-### circbuf
+## Troubleshooting
 
-| Check | Result |
-|---|---|
-| `insmod` / `rmmod` (default 4096-byte buffer) | ✅ Pass |
-| `basic_test` — write → read → `ioctl` roundtrip | ✅ Pass |
-| `query_stats` — `ioctl` buffer introspection | ✅ `capacity=4096 used=0 available=4096` |
-| `stress` — 4 writers / 4 readers, 5 s | ✅ `total_written=13682240 == total_read=13682240` |
-| Reload with `buffer_size=16384` | ✅ `capacity=16384` confirmed |
-| `dmesg` | No panics, no lockups |
+- **Module build fails:** confirm that the kernel headers and compiler configuration match the target kernel.
+- **`insmod` fails:** inspect `dmesg` for registration errors, missing symbols, or resource conflicts.
+- **A device node is missing:** check whether module initialization succeeded and whether the driver registers the expected device interface.
+- **QEMU or Docker tests fail:** check Docker availability, image builds, architecture compatibility, and the driver's documented launch command.
+- **Network tests fail:** verify that both virtual interfaces are registered and that the test uses the expected network namespace configuration.
 
-### vblk
+Kernel modules run with high privileges and can affect system stability. Prefer an isolated VM or the documented container/QEMU environment when experimenting.
 
-| Check | Result |
-|---|---|
-| `insmod` / `rmmod` (default 16 MiB) | ✅ Pass |
-| `basic_test` — `O_DIRECT` `pwrite`/`pread`/`pwritev` + `ioctl` | ✅ `capacity_bytes=16777216 reads=3 writes=3` |
-| `stress` — 4 threads, disjoint regions, 5 s | ✅ `total_written≈62 MB` (~11.8 MiB/s), zero corruption |
-| `mke2fs` + `mount -t ext2` + file I/O + `umount` | ✅ Pass |
-| Reload with `disk_size_mb=8` | ✅ `capacity_bytes=8388608` confirmed |
-| `dmesg` | No panics, no lockups |
+## Further Reading
 
-See the [`vblk` README](linux-block-device-driver/) for the full GCP-verified
-benchmark data.
+- *Linux Device Drivers, 3rd Edition* — Jonathan Corbet, Alessandro Rubini, and Greg Kroah-Hartman.
+- *Linux Kernel Development, 3rd Edition* — Robert Love.
+- Linux kernel documentation: `Documentation/driver-api/`, `Documentation/block/`, `Documentation/networking/`, and `Documentation/PCI/` in the kernel source tree.
 
-### netdrv
+## Contributing
 
-| Check | Result |
-|---|---|
-| Module load — `vnet0` / `vnet1` registered | ✅ |
-| Carrier state on `open` / `stop` | ✅ |
-| `ping` across netns pair | ✅ 4/4 packets, 0% loss |
-| `tx_packets` / `rx_packets` symmetry | ✅ 11 == 11 |
-| Flood ping with `ring_size=4` | ✅ 2000/2000, 0% loss |
-| TX backpressure under `iperf3` UDP load | ✅ `tx_queue_stops/wakes = 2`, 0 packets lost (59670 == 59670) |
-| 10× load/unload loop | ✅ clean `dmesg` throughout |
-
-### pcie-edu-driver
-
-| Check | Result |
-|---|---|
-| `edu` device enumerated (`lspci -d 1234:11e8`) | ✅ Pass |
-| `probe()` — BAR0 mapped, ident register read, DMA buffer allocated | ✅ Pass |
-| MSI vector registered (`/proc/interrupts`) | ✅ Pass |
-| `/dev/pcie_edu` opens successfully | ✅ Pass |
-| Liveness register round-trip (`write_val` → `~write_val`) | ✅ Pass |
-| `PCIE_EDU_COMPUTE` — 0!, 1!, 5!, 10!, 12! via MSI | ✅ Pass (5/5) |
-| `PCIE_EDU_DMA_TRANSFER` — 4096-byte host→device→host | ✅ Pass |
-| `remove()` / `rmmod` — no leaked MMIO or IRQ | ✅ Pass |
-
----
-
-## References
-
-- *Linux Device Drivers, 3rd Edition* — Corbet, Rubini, Kroah-Hartman (free at lwn.net)
-- *Linux Kernel Development, 3rd Edition* — Robert Love
-- Rosen, R. *Linux Kernel Networking: Implementation and Theory*
-- `Documentation/driver-api/`, `Documentation/block/`, `Documentation/networking/napi.rst`, `Documentation/PCI/pci.rst` in the Linux kernel source tree
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE).
+When extending the project, keep each driver focused on its subsystem, document any configuration requirements, and add or update tests for behavioural changes. Include the kernel version and environment when reporting test results so the behaviour can be reproduced.
